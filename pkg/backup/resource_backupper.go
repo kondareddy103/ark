@@ -29,7 +29,6 @@ import (
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
 	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cloudprovider"
 	"github.com/heptio/ark/pkg/discovery"
 	"github.com/heptio/ark/pkg/kuberesource"
 	"github.com/heptio/ark/pkg/podexec"
@@ -51,9 +50,10 @@ type resourceBackupperFactory interface {
 		podCommandExecutor podexec.PodCommandExecutor,
 		tarWriter tarWriter,
 		resourceHooks []resourceHook,
-		blockStore cloudprovider.BlockStore,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
+		snapshotLocations []*api.VolumeSnapshotLocation,
+		blockStoreGetter blockStoreGetter,
 	) resourceBackupper
 }
 
@@ -72,9 +72,10 @@ func (f *defaultResourceBackupperFactory) newResourceBackupper(
 	podCommandExecutor podexec.PodCommandExecutor,
 	tarWriter tarWriter,
 	resourceHooks []resourceHook,
-	blockStore cloudprovider.BlockStore,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
+	snapshotLocations []*api.VolumeSnapshotLocation,
+	blockStoreGetter blockStoreGetter,
 ) resourceBackupper {
 	return &defaultResourceBackupper{
 		log:                   log,
@@ -89,10 +90,12 @@ func (f *defaultResourceBackupperFactory) newResourceBackupper(
 		podCommandExecutor:    podCommandExecutor,
 		tarWriter:             tarWriter,
 		resourceHooks:         resourceHooks,
-		blockStore:            blockStore,
 		resticBackupper:       resticBackupper,
 		resticSnapshotTracker: resticSnapshotTracker,
-		itemBackupperFactory:  &defaultItemBackupperFactory{},
+		snapshotLocations:     snapshotLocations,
+		blockStoreGetter:      blockStoreGetter,
+
+		itemBackupperFactory: &defaultItemBackupperFactory{},
 	}
 }
 
@@ -113,10 +116,11 @@ type defaultResourceBackupper struct {
 	podCommandExecutor    podexec.PodCommandExecutor
 	tarWriter             tarWriter
 	resourceHooks         []resourceHook
-	blockStore            cloudprovider.BlockStore
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
 	itemBackupperFactory  itemBackupperFactory
+	snapshotLocations     []*api.VolumeSnapshotLocation
+	blockStoreGetter      blockStoreGetter
 }
 
 // backupResource backs up all the objects for a given group-version-resource.
@@ -189,9 +193,10 @@ func (rb *defaultResourceBackupper) backupResource(
 		rb.resourceHooks,
 		rb.dynamicFactory,
 		rb.discoveryHelper,
-		rb.blockStore,
 		rb.resticBackupper,
 		rb.resticSnapshotTracker,
+		rb.snapshotLocations,
+		rb.blockStoreGetter,
 	)
 
 	namespacesToList := getNamespacesToList(rb.namespaces)

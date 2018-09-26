@@ -54,9 +54,10 @@ type itemBackupperFactory interface {
 		resourceHooks []resourceHook,
 		dynamicFactory client.DynamicFactory,
 		discoveryHelper discovery.Helper,
-		blockStore cloudprovider.BlockStore,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
+		snapshotLocations []*api.VolumeSnapshotLocation,
+		blockStoreGetter blockStoreGetter,
 	) ItemBackupper
 }
 
@@ -72,26 +73,29 @@ func (f *defaultItemBackupperFactory) newItemBackupper(
 	resourceHooks []resourceHook,
 	dynamicFactory client.DynamicFactory,
 	discoveryHelper discovery.Helper,
-	blockStore cloudprovider.BlockStore,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
+	snapshotLocations []*api.VolumeSnapshotLocation,
+	blockStoreGetter blockStoreGetter,
 ) ItemBackupper {
 	ib := &defaultItemBackupper{
-		backup:          backup,
-		namespaces:      namespaces,
-		resources:       resources,
-		backedUpItems:   backedUpItems,
-		actions:         actions,
-		tarWriter:       tarWriter,
-		resourceHooks:   resourceHooks,
-		dynamicFactory:  dynamicFactory,
-		discoveryHelper: discoveryHelper,
-		blockStore:      blockStore,
+		backup:                backup,
+		namespaces:            namespaces,
+		resources:             resources,
+		backedUpItems:         backedUpItems,
+		actions:               actions,
+		tarWriter:             tarWriter,
+		resourceHooks:         resourceHooks,
+		dynamicFactory:        dynamicFactory,
+		discoveryHelper:       discoveryHelper,
+		resticBackupper:       resticBackupper,
+		resticSnapshotTracker: resticSnapshotTracker,
+		snapshotLocations:     snapshotLocations,
+		blockStoreGetter:      blockStoreGetter,
+
 		itemHookHandler: &defaultItemHookHandler{
 			podCommandExecutor: podCommandExecutor,
 		},
-		resticBackupper:       resticBackupper,
-		resticSnapshotTracker: resticSnapshotTracker,
 	}
 
 	// this is for testing purposes
@@ -114,12 +118,14 @@ type defaultItemBackupper struct {
 	resourceHooks         []resourceHook
 	dynamicFactory        client.DynamicFactory
 	discoveryHelper       discovery.Helper
-	blockStore            cloudprovider.BlockStore
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
+	snapshotLocations     []*api.VolumeSnapshotLocation
+	blockStoreGetter      blockStoreGetter
 
-	itemHookHandler         itemHookHandler
-	additionalItemBackupper ItemBackupper
+	itemHookHandler             itemHookHandler
+	additionalItemBackupper     ItemBackupper
+	snapshotLocationBlockStores map[string]cloudprovider.BlockStore
 }
 
 // backupItem backs up an individual item to tarWriter. The item may be excluded based on the
@@ -222,9 +228,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	}
 
 	if groupResource == kuberesource.PersistentVolumes {
-		if ib.blockStore == nil {
-			log.Debug("Skipping Persistent Volume snapshot because they're not enabled.")
-		} else if err := ib.takePVSnapshot(obj, ib.backup, log); err != nil {
+		if err := ib.takePVSnapshot(obj, ib.backup, log); err != nil {
 			backupErrs = append(backupErrs, err)
 		}
 	}
@@ -358,6 +362,30 @@ func (ib *defaultItemBackupper) executeActions(
 	return obj, nil
 }
 
+// getBlockStore gets and initializes a BlockStore given a VolumeSnapshotLocation, returning an
+// existing one if one's already been initialized for the location.
+func (ib *defaultItemBackupper) getBlockStore(snapshotLocation *api.VolumeSnapshotLocation) (cloudprovider.BlockStore, error) {
+	if bs, ok := ib.snapshotLocationBlockStores[snapshotLocation.Name]; ok {
+		return bs, nil
+	}
+
+	bs, err := ib.blockStoreGetter.GetBlockStore(snapshotLocation.Spec.Provider)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := bs.Init(snapshotLocation.Spec.Config); err != nil {
+		return nil, err
+	}
+
+	if ib.snapshotLocationBlockStores == nil {
+		ib.snapshotLocationBlockStores = make(map[string]cloudprovider.BlockStore)
+	}
+	ib.snapshotLocationBlockStores[snapshotLocation.Name] = bs
+
+	return bs, nil
+}
+
 // zoneLabel is the label that stores availability-zone info
 // on PVs
 const zoneLabel = "failure-domain.beta.kubernetes.io/zone"
@@ -402,11 +430,38 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, backup 
 		log.Infof("label %q is not present on PersistentVolume", zoneLabel)
 	}
 
-	volumeID, err := ib.blockStore.GetVolumeID(obj)
-	if err != nil {
-		return errors.Wrapf(err, "error getting volume ID for PersistentVolume")
+	var (
+		volumeID   string
+		blockStore cloudprovider.BlockStore
+	)
+
+	for _, snapshotLocation := range ib.snapshotLocations {
+		bs, err := ib.getBlockStore(snapshotLocation)
+		if err != nil {
+			log.WithError(err).WithField("volumeSnapshotLocation", snapshotLocation).Error("Error getting block store for volume snapshot location")
+			continue
+		}
+
+		log := log.WithFields(map[string]interface{}{
+			"volumeSnapshotLocation": snapshotLocation,
+			"persistentVolume":       metadata.GetName(),
+		})
+
+		if volumeID, err = bs.GetVolumeID(obj); err != nil {
+			log.WithError(err).Errorf("Error attempting to get volume ID for persistent volume")
+			continue
+		}
+		if volumeID == "" {
+			log.Infof("No volume ID returned by block store for persistent volume")
+			continue
+		}
+
+		log.Infof("Got volume ID for persistent volume")
+		blockStore = bs
+		break
 	}
-	if volumeID == "" {
+
+	if blockStore == nil {
 		log.Info("PersistentVolume is not a supported volume type for snapshots, skipping.")
 		return nil
 	}
@@ -419,14 +474,14 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, backup 
 	}
 
 	log.Info("Snapshotting PersistentVolume")
-	snapshotID, err := ib.blockStore.CreateSnapshot(volumeID, pvFailureDomainZone, tags)
+	snapshotID, err := blockStore.CreateSnapshot(volumeID, pvFailureDomainZone, tags)
 	if err != nil {
 		// log+error on purpose - log goes to the per-backup log file, error goes to the backup
 		log.WithError(err).Error("error creating snapshot")
 		return errors.WithMessage(err, "error creating snapshot")
 	}
 
-	volumeType, iops, err := ib.blockStore.GetVolumeInfo(volumeID, pvFailureDomainZone)
+	volumeType, iops, err := blockStore.GetVolumeInfo(volumeID, pvFailureDomainZone)
 	if err != nil {
 		log.WithError(err).Error("error getting volume info")
 		return errors.WithMessage(err, "error getting volume info")

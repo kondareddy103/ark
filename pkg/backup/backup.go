@@ -46,7 +46,7 @@ import (
 type Backupper interface {
 	// Backup takes a backup using the specification in the api.Backup and writes backup and log data
 	// to the given writers.
-	Backup(logger logrus.FieldLogger, backup *api.Backup, backupFile io.Writer, actions []ItemAction) error
+	Backup(logger logrus.FieldLogger, backup *api.Backup, backupFile io.Writer, actions []ItemAction, snapshotLocations []*api.VolumeSnapshotLocation, blockStoreGetter blockStoreGetter) error
 }
 
 // kubernetesBackupper implements Backupper.
@@ -55,7 +55,6 @@ type kubernetesBackupper struct {
 	discoveryHelper        discovery.Helper
 	podCommandExecutor     podexec.PodCommandExecutor
 	groupBackupperFactory  groupBackupperFactory
-	blockStore             cloudprovider.BlockStore
 	resticBackupperFactory restic.BackupperFactory
 	resticTimeout          time.Duration
 }
@@ -93,7 +92,6 @@ func NewKubernetesBackupper(
 	discoveryHelper discovery.Helper,
 	dynamicFactory client.DynamicFactory,
 	podCommandExecutor podexec.PodCommandExecutor,
-	blockStore cloudprovider.BlockStore,
 	resticBackupperFactory restic.BackupperFactory,
 	resticTimeout time.Duration,
 ) (Backupper, error) {
@@ -102,7 +100,6 @@ func NewKubernetesBackupper(
 		dynamicFactory:         dynamicFactory,
 		podCommandExecutor:     podCommandExecutor,
 		groupBackupperFactory:  &defaultGroupBackupperFactory{},
-		blockStore:             blockStore,
 		resticBackupperFactory: resticBackupperFactory,
 		resticTimeout:          resticTimeout,
 	}, nil
@@ -209,9 +206,20 @@ func getResourceHook(hookSpec api.BackupResourceHookSpec, discoveryHelper discov
 	return h, nil
 }
 
+type blockStoreGetter interface {
+	GetBlockStore(name string) (cloudprovider.BlockStore, error)
+}
+
 // Backup backs up the items specified in the Backup, placing them in a gzip-compressed tar file
 // written to backupFile. The finalized api.Backup is written to metadata.
-func (kb *kubernetesBackupper) Backup(logger logrus.FieldLogger, backup *api.Backup, backupFile io.Writer, actions []ItemAction) error {
+func (kb *kubernetesBackupper) Backup(
+	logger logrus.FieldLogger,
+	backup *api.Backup,
+	backupFile io.Writer,
+	actions []ItemAction,
+	snapshotLocations []*api.VolumeSnapshotLocation,
+	blockStoreGetter blockStoreGetter,
+) error {
 	gzippedData := gzip.NewWriter(backupFile)
 	defer gzippedData.Close()
 
@@ -276,9 +284,10 @@ func (kb *kubernetesBackupper) Backup(logger logrus.FieldLogger, backup *api.Bac
 		kb.podCommandExecutor,
 		tw,
 		resourceHooks,
-		kb.blockStore,
 		resticBackupper,
 		newPVCSnapshotTracker(),
+		snapshotLocations,
+		blockStoreGetter,
 	)
 
 	for _, group := range kb.discoveryHelper.Resources() {

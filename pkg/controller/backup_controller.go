@@ -56,7 +56,6 @@ type backupController struct {
 	*genericController
 
 	backupper                backup.Backupper
-	pvProviderExists         bool
 	lister                   listers.BackupLister
 	client                   arkv1client.BackupsGetter
 	clock                    clock.Clock
@@ -75,7 +74,6 @@ func NewBackupController(
 	backupInformer informers.BackupInformer,
 	client arkv1client.BackupsGetter,
 	backupper backup.Backupper,
-	pvProviderExists bool,
 	logger logrus.FieldLogger,
 	backupLogLevel logrus.Level,
 	newPluginManager func(logrus.FieldLogger) plugin.Manager,
@@ -89,7 +87,6 @@ func NewBackupController(
 	c := &backupController{
 		genericController:        newGenericController("backup", logger),
 		backupper:                backupper,
-		pvProviderExists:         pvProviderExists,
 		lister:                   backupInformer.Lister(),
 		client:                   client,
 		clock:                    &clock.RealClock{},
@@ -380,7 +377,8 @@ func (c *backupController) runBackup(backup *api.Backup, backupLocation *api.Bac
 	var backupJSONToUpload, backupFileToUpload io.Reader
 
 	// Do the actual backup
-	if err := c.backupper.Backup(log, backup, backupFile, actions); err != nil {
+	// TODO need to pass the VolumeSnapshotLocations down here
+	if err := c.backupper.Backup(log, backup, backupFile, actions, nil, pluginManager); err != nil {
 		errs = append(errs, err)
 
 		backup.Status.Phase = api.BackupPhaseFailed
