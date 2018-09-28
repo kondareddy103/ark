@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kuberrs "k8s.io/apimachinery/pkg/util/errors"
 
+	"github.com/heptio/ark/pkg/archive"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/discovery"
 	"github.com/heptio/ark/pkg/podexec"
@@ -42,7 +43,7 @@ type groupBackupperFactory interface {
 		backedUpItems map[itemKey]struct{},
 		cohabitatingResources map[string]*cohabitatingResource,
 		podCommandExecutor podexec.PodCommandExecutor,
-		tarWriter tarWriter,
+		archiveWriter archive.Writer,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
 		blockStoreGetter BlockStoreGetter,
@@ -59,7 +60,7 @@ func (f *defaultGroupBackupperFactory) newGroupBackupper(
 	backedUpItems map[itemKey]struct{},
 	cohabitatingResources map[string]*cohabitatingResource,
 	podCommandExecutor podexec.PodCommandExecutor,
-	tarWriter tarWriter,
+	archiveWriter archive.Writer,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
 	blockStoreGetter BlockStoreGetter,
@@ -72,7 +73,7 @@ func (f *defaultGroupBackupperFactory) newGroupBackupper(
 		backedUpItems:         backedUpItems,
 		cohabitatingResources: cohabitatingResources,
 		podCommandExecutor:    podCommandExecutor,
-		tarWriter:             tarWriter,
+		archiveWriter:         archiveWriter,
 		resticBackupper:       resticBackupper,
 		resticSnapshotTracker: resticSnapshotTracker,
 		blockStoreGetter:      blockStoreGetter,
@@ -93,7 +94,7 @@ type defaultGroupBackupper struct {
 	backedUpItems            map[itemKey]struct{}
 	cohabitatingResources    map[string]*cohabitatingResource
 	podCommandExecutor       podexec.PodCommandExecutor
-	tarWriter                tarWriter
+	archiveWriter            archive.Writer
 	resticBackupper          restic.Backupper
 	resticSnapshotTracker    *pvcSnapshotTracker
 	resourceBackupperFactory resourceBackupperFactory
@@ -113,7 +114,7 @@ func (gb *defaultGroupBackupper) backupGroup(group *metav1.APIResourceList) erro
 			gb.backedUpItems,
 			gb.cohabitatingResources,
 			gb.podCommandExecutor,
-			gb.tarWriter,
+			gb.archiveWriter,
 			gb.resticBackupper,
 			gb.resticSnapshotTracker,
 			gb.blockStoreGetter,

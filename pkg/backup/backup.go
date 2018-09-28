@@ -17,8 +17,6 @@ limitations under the License.
 package backup
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -33,6 +31,7 @@ import (
 	kuberrs "k8s.io/apimachinery/pkg/util/errors"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
+	"github.com/heptio/ark/pkg/archive"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/cloudprovider"
 	"github.com/heptio/ark/pkg/discovery"
@@ -212,12 +211,15 @@ type BlockStoreGetter interface {
 
 // Backup backs up the items specified in the Backup, placing them in a gzip-compressed tar file
 // written to backupFile. The finalized api.Backup is written to metadata.
-func (kb *kubernetesBackupper) Backup(logger logrus.FieldLogger, backup *Request, backupFile io.Writer, actions []ItemAction, blockStoreGetter BlockStoreGetter) error {
-	gzippedData := gzip.NewWriter(backupFile)
-	defer gzippedData.Close()
-
-	tw := tar.NewWriter(gzippedData)
-	defer tw.Close()
+func (kb *kubernetesBackupper) Backup(
+	logger logrus.FieldLogger,
+	backup *Request,
+	backupFile io.Writer,
+	actions []ItemAction,
+	blockStoreGetter BlockStoreGetter,
+) error {
+	archive := archive.NewGzipTarWriter(backupFile)
+	defer archive.Close()
 
 	log := logger.WithField("backup", kubeutil.NamespaceAndName(backup))
 	log.Info("Starting backup")
@@ -270,7 +272,7 @@ func (kb *kubernetesBackupper) Backup(logger logrus.FieldLogger, backup *Request
 		make(map[itemKey]struct{}),
 		cohabitatingResources(),
 		kb.podCommandExecutor,
-		tw,
+		archive,
 		resticBackupper,
 		newPVCSnapshotTracker(),
 		blockStoreGetter,
@@ -291,10 +293,4 @@ func (kb *kubernetesBackupper) Backup(logger logrus.FieldLogger, backup *Request
 	}
 
 	return err
-}
-
-type tarWriter interface {
-	io.Closer
-	Write([]byte) (int, error)
-	WriteHeader(*tar.Header) error
 }

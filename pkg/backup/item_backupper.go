@@ -17,11 +17,6 @@ limitations under the License.
 package backup
 
 import (
-	"archive/tar"
-	"encoding/json"
-	"path/filepath"
-	"time"
-
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
@@ -34,6 +29,7 @@ import (
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
+	"github.com/heptio/ark/pkg/archive"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/cloudprovider"
 	"github.com/heptio/ark/pkg/discovery"
@@ -47,7 +43,7 @@ type itemBackupperFactory interface {
 		backup *Request,
 		backedUpItems map[itemKey]struct{},
 		podCommandExecutor podexec.PodCommandExecutor,
-		tarWriter tarWriter,
+		archiveWriter archive.Writer,
 		dynamicFactory client.DynamicFactory,
 		discoveryHelper discovery.Helper,
 		resticBackupper restic.Backupper,
@@ -62,7 +58,7 @@ func (f *defaultItemBackupperFactory) newItemBackupper(
 	backup *Request,
 	backedUpItems map[itemKey]struct{},
 	podCommandExecutor podexec.PodCommandExecutor,
-	tarWriter tarWriter,
+	archiveWriter archive.Writer,
 	dynamicFactory client.DynamicFactory,
 	discoveryHelper discovery.Helper,
 	resticBackupper restic.Backupper,
@@ -72,7 +68,7 @@ func (f *defaultItemBackupperFactory) newItemBackupper(
 	ib := &defaultItemBackupper{
 		backup:                backup,
 		backedUpItems:         backedUpItems,
-		tarWriter:             tarWriter,
+		archiveWriter:         archiveWriter,
 		dynamicFactory:        dynamicFactory,
 		discoveryHelper:       discoveryHelper,
 		resticBackupper:       resticBackupper,
@@ -97,7 +93,7 @@ type ItemBackupper interface {
 type defaultItemBackupper struct {
 	backup                *Request
 	backedUpItems         map[itemKey]struct{}
-	tarWriter             tarWriter
+	archiveWriter         archive.Writer
 	dynamicFactory        client.DynamicFactory
 	discoveryHelper       discovery.Helper
 	resticBackupper       restic.Backupper
@@ -236,32 +232,8 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 		return kubeerrs.NewAggregate(backupErrs)
 	}
 
-	var filePath string
-	if namespace != "" {
-		filePath = filepath.Join(api.ResourcesDir, groupResource.String(), api.NamespaceScopedDir, namespace, name+".json")
-	} else {
-		filePath = filepath.Join(api.ResourcesDir, groupResource.String(), api.ClusterScopedDir, name+".json")
-	}
-
-	itemBytes, err := json.Marshal(obj.UnstructuredContent())
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	hdr := &tar.Header{
-		Name:     filePath,
-		Size:     int64(len(itemBytes)),
-		Typeflag: tar.TypeReg,
-		Mode:     0755,
-		ModTime:  time.Now(),
-	}
-
-	if err := ib.tarWriter.WriteHeader(hdr); err != nil {
-		return errors.WithStack(err)
-	}
-
-	if _, err := ib.tarWriter.Write(itemBytes); err != nil {
-		return errors.WithStack(err)
+	if err := ib.archiveWriter.Write(groupResource.String(), namespace, name, obj.UnstructuredContent()); err != nil {
+		return err
 	}
 
 	return nil

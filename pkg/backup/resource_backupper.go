@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kuberrs "k8s.io/apimachinery/pkg/util/errors"
 
+	"github.com/heptio/ark/pkg/archive"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/discovery"
 	"github.com/heptio/ark/pkg/kuberesource"
@@ -44,7 +45,7 @@ type resourceBackupperFactory interface {
 		backedUpItems map[itemKey]struct{},
 		cohabitatingResources map[string]*cohabitatingResource,
 		podCommandExecutor podexec.PodCommandExecutor,
-		tarWriter tarWriter,
+		archiveWriter archive.Writer,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
 		blockStoreGetter BlockStoreGetter,
@@ -61,7 +62,7 @@ func (f *defaultResourceBackupperFactory) newResourceBackupper(
 	backedUpItems map[itemKey]struct{},
 	cohabitatingResources map[string]*cohabitatingResource,
 	podCommandExecutor podexec.PodCommandExecutor,
-	tarWriter tarWriter,
+	archiveWriter archive.Writer,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
 	blockStoreGetter BlockStoreGetter,
@@ -74,7 +75,7 @@ func (f *defaultResourceBackupperFactory) newResourceBackupper(
 		backedUpItems:         backedUpItems,
 		cohabitatingResources: cohabitatingResources,
 		podCommandExecutor:    podCommandExecutor,
-		tarWriter:             tarWriter,
+		archiveWriter:         archiveWriter,
 		resticBackupper:       resticBackupper,
 		resticSnapshotTracker: resticSnapshotTracker,
 		blockStoreGetter:      blockStoreGetter,
@@ -95,7 +96,7 @@ type defaultResourceBackupper struct {
 	backedUpItems         map[itemKey]struct{}
 	cohabitatingResources map[string]*cohabitatingResource
 	podCommandExecutor    podexec.PodCommandExecutor
-	tarWriter             tarWriter
+	archiveWriter         archive.Writer
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
 	itemBackupperFactory  itemBackupperFactory
@@ -165,7 +166,7 @@ func (rb *defaultResourceBackupper) backupResource(
 		rb.backup,
 		rb.backedUpItems,
 		rb.podCommandExecutor,
-		rb.tarWriter,
+		rb.archiveWriter,
 		rb.dynamicFactory,
 		rb.discoveryHelper,
 		rb.resticBackupper,

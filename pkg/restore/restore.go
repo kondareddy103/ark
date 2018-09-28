@@ -17,15 +17,10 @@ limitations under the License.
 package restore
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	go_context "context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -47,6 +42,7 @@ import (
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
+	"github.com/heptio/ark/pkg/archive"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/cloudprovider"
 	"github.com/heptio/ark/pkg/discovery"
@@ -331,49 +327,24 @@ type context struct {
 func (ctx *context) execute() (api.RestoreResult, api.RestoreResult) {
 	ctx.log.Infof("Starting restore of backup %s", kube.NamespaceAndName(ctx.backup))
 
-	dir, err := ctx.unzipAndExtractBackup(ctx.backupReader)
-	if err != nil {
+	archiveReader := archive.NewGzipTarReader(ctx.backupReader)
+	if err := archiveReader.Extract(); err != nil {
 		ctx.log.Infof("error unzipping and extracting: %v", err)
 		return api.RestoreResult{}, api.RestoreResult{Ark: []string{err.Error()}}
 	}
-	defer ctx.fileSystem.RemoveAll(dir)
+	defer archiveReader.Close()
 
-	return ctx.restoreFromDir(dir)
+	return ctx.restoreFromArchive(archiveReader)
 }
 
 // restoreFromDir executes a restore based on backup data contained within a local
 // directory.
-func (ctx *context) restoreFromDir(dir string) (api.RestoreResult, api.RestoreResult) {
+func (ctx *context) restoreFromArchive(archiveReader archive.Reader) (api.RestoreResult, api.RestoreResult) {
 	warnings, errs := api.RestoreResult{}, api.RestoreResult{}
 
 	namespaceFilter := collections.NewIncludesExcludes().
 		Includes(ctx.restore.Spec.IncludedNamespaces...).
 		Excludes(ctx.restore.Spec.ExcludedNamespaces...)
-
-	// Make sure the top level "resources" dir exists:
-	resourcesDir := filepath.Join(dir, api.ResourcesDir)
-	rde, err := ctx.fileSystem.DirExists(resourcesDir)
-	if err != nil {
-		addArkError(&errs, err)
-		return warnings, errs
-	}
-	if !rde {
-		addArkError(&errs, errors.New("backup does not contain top level resources directory"))
-		return warnings, errs
-	}
-
-	resourceDirs, err := ctx.fileSystem.ReadDir(resourcesDir)
-	if err != nil {
-		addArkError(&errs, err)
-		return warnings, errs
-	}
-
-	resourceDirsMap := make(map[string]os.FileInfo)
-
-	for _, rscDir := range resourceDirs {
-		rscName := rscDir.Name()
-		resourceDirsMap[rscName] = rscDir
-	}
 
 	existingNamespaces := sets.NewString()
 
@@ -394,49 +365,29 @@ func (ctx *context) restoreFromDir(dir string) (api.RestoreResult, api.RestoreRe
 			continue
 		}
 
-		rscDir := resourceDirsMap[resource.String()]
-		if rscDir == nil {
-			continue
-		}
-
-		resourcePath := filepath.Join(resourcesDir, rscDir.Name())
-
-		clusterSubDir := filepath.Join(resourcePath, api.ClusterScopedDir)
-		clusterSubDirExists, err := ctx.fileSystem.DirExists(clusterSubDir)
+		scope, exists, err := archiveReader.GetResourceScope(resource.String())
 		if err != nil {
 			addArkError(&errs, err)
 			return warnings, errs
 		}
-		if clusterSubDirExists {
-			w, e := ctx.restoreResource(resource.String(), "", clusterSubDir)
+		if !exists {
+			continue
+		}
+
+		if scope == archive.ResourceScopeCluster {
+			w, e := ctx.restoreResource(archiveReader, resource.String(), "")
 			merge(&warnings, &w)
 			merge(&errs, &e)
 			continue
 		}
 
-		nsSubDir := filepath.Join(resourcePath, api.NamespaceScopedDir)
-		nsSubDirExists, err := ctx.fileSystem.DirExists(nsSubDir)
-		if err != nil {
-			addArkError(&errs, err)
-			return warnings, errs
-		}
-		if !nsSubDirExists {
-			continue
-		}
-
-		nsDirs, err := ctx.fileSystem.ReadDir(nsSubDir)
+		namespaces, err := archiveReader.ListNamespaces(resource.String())
 		if err != nil {
 			addArkError(&errs, err)
 			return warnings, errs
 		}
 
-		for _, nsDir := range nsDirs {
-			if !nsDir.IsDir() {
-				continue
-			}
-			nsName := nsDir.Name()
-			nsPath := filepath.Join(nsSubDir, nsName)
-
+		for _, nsName := range namespaces {
 			if !namespaceFilter.ShouldInclude(nsName) {
 				ctx.log.Infof("Skipping namespace %s", nsName)
 				continue
@@ -454,7 +405,7 @@ func (ctx *context) restoreFromDir(dir string) (api.RestoreResult, api.RestoreRe
 			// create a blank one.
 			if !existingNamespaces.Has(mappedNsName) {
 				logger := ctx.log.WithField("namespace", nsName)
-				ns := getNamespace(logger, filepath.Join(dir, api.ResourcesDir, "namespaces", api.ClusterScopedDir, nsName+".json"), mappedNsName)
+				ns := getNamespace(logger, archiveReader, nsName, mappedNsName)
 				if _, err := kube.EnsureNamespaceExists(ns, ctx.namespaceClient); err != nil {
 					addArkError(&errs, err)
 					continue
@@ -465,7 +416,7 @@ func (ctx *context) restoreFromDir(dir string) (api.RestoreResult, api.RestoreRe
 				existingNamespaces.Insert(mappedNsName)
 			}
 
-			w, e := ctx.restoreResource(resource.String(), mappedNsName, nsPath)
+			w, e := ctx.restoreResource(archiveReader, resource.String(), mappedNsName)
 			merge(&warnings, &w)
 			merge(&errs, &e)
 		}
@@ -495,11 +446,11 @@ func (ctx *context) restoreFromDir(dir string) (api.RestoreResult, api.RestoreRe
 // create before restoring anything into it. It will come from the backup
 // tarball if it exists, else will be a new one. If from the tarball, it
 // will retain its labels, annotations, and spec.
-func getNamespace(logger logrus.FieldLogger, path, remappedName string) *v1.Namespace {
+func getNamespace(logger logrus.FieldLogger, archiveReader archive.Reader, nsName, remappedName string) *v1.Namespace {
 	var nsBytes []byte
 	var err error
 
-	if nsBytes, err = ioutil.ReadFile(path); err != nil {
+	if nsBytes, err = archiveReader.Get("namespaces", "", nsName+".json"); err != nil {
 		return &v1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: remappedName,
@@ -561,7 +512,7 @@ func addToResult(r *api.RestoreResult, ns string, e error) {
 
 // restoreResource restores the specified cluster or namespace scoped resource. If namespace is
 // empty we are restoring a cluster level resource, otherwise into the specified namespace.
-func (ctx *context) restoreResource(resource, namespace, resourcePath string) (api.RestoreResult, api.RestoreResult) {
+func (ctx *context) restoreResource(archiveReader archive.Reader, resource, namespace string) (api.RestoreResult, api.RestoreResult) {
 	warnings, errs := api.RestoreResult{}, api.RestoreResult{}
 
 	if ctx.restore.Spec.IncludeClusterResources != nil && !*ctx.restore.Spec.IncludeClusterResources && namespace == "" {
@@ -570,14 +521,14 @@ func (ctx *context) restoreResource(resource, namespace, resourcePath string) (a
 	}
 
 	if namespace != "" {
-		ctx.log.Infof("Restoring resource '%s' into namespace '%s' from: %s", resource, namespace, resourcePath)
+		ctx.log.Infof("Restoring resource %q into namespace %q", resource, namespace)
 	} else {
-		ctx.log.Infof("Restoring cluster level resource '%s' from: %s", resource, resourcePath)
+		ctx.log.Infof("Restoring cluster level resource %q", resource)
 	}
 
-	files, err := ctx.fileSystem.ReadDir(resourcePath)
+	files, err := archiveReader.ListContents(resource, namespace)
 	if err != nil {
-		addToResult(&errs, namespace, fmt.Errorf("error reading %q resource directory: %v", resource, err))
+		addToResult(&errs, namespace, fmt.Errorf("error reading resource directory %q: %v", resource, err))
 		return warnings, errs
 	}
 	if len(files) == 0 {
@@ -606,10 +557,16 @@ func (ctx *context) restoreResource(resource, namespace, resourcePath string) (a
 	}
 
 	for _, file := range files {
-		fullPath := filepath.Join(resourcePath, file.Name())
-		obj, err := ctx.unmarshal(fullPath)
+		bytes, err := archiveReader.Get(resource, namespace, file)
 		if err != nil {
-			addToResult(&errs, namespace, fmt.Errorf("error decoding %q: %v", fullPath, err))
+			addToResult(&errs, namespace, errors.Wrapf(err, "error getting item %q for resource %q in namespace %q", file, resource, namespace))
+			continue
+		}
+
+		obj := new(unstructured.Unstructured)
+		err = json.Unmarshal(bytes, obj)
+		if err != nil {
+			addToResult(&errs, namespace, errors.Wrapf(err, "error decoding item %q for resource %q in namespace %q", file, resource, namespace))
 			continue
 		}
 
@@ -619,7 +576,7 @@ func (ctx *context) restoreResource(resource, namespace, resourcePath string) (a
 
 		complete, err := isCompleted(obj, groupResource)
 		if err != nil {
-			addToResult(&errs, namespace, fmt.Errorf("error checking completion %q: %v", fullPath, err))
+			addToResult(&errs, namespace, errors.Wrapf(err, "error checking completion for item %q for resource %q in namespace %q", file, resource, namespace))
 			continue
 		}
 		if complete {
@@ -667,7 +624,7 @@ func (ctx *context) restoreResource(resource, namespace, resourcePath string) (a
 			// restore the PV from snapshot (if applicable)
 			updatedObj, err := ctx.pvRestorer.executePVAction(obj)
 			if err != nil {
-				addToResult(&errs, namespace, fmt.Errorf("error executing PVAction for %s: %v", fullPath, err))
+				addToResult(&errs, namespace, errors.Wrapf(err, "error executing PVAction for item %q for resource %q in namespace %q", file, resource, namespace))
 				continue
 			}
 			obj = updatedObj
@@ -719,16 +676,16 @@ func (ctx *context) restoreResource(resource, namespace, resourcePath string) (a
 
 			updatedObj, warning, err := action.Execute(obj, ctx.restore)
 			if warning != nil {
-				addToResult(&warnings, namespace, fmt.Errorf("warning preparing %s: %v", fullPath, warning))
+				addToResult(&warnings, namespace, errors.Wrapf(err, "warning preparing item %q for resource %q in namespace %q", file, resource, namespace))
 			}
 			if err != nil {
-				addToResult(&errs, namespace, fmt.Errorf("error preparing %s: %v", fullPath, err))
+				addToResult(&errs, namespace, errors.Wrapf(err, "error preparing item %q for resource %q in namespace %q", file, resource, namespace))
 				continue
 			}
 
 			unstructuredObj, ok := updatedObj.(*unstructured.Unstructured)
 			if !ok {
-				addToResult(&errs, namespace, fmt.Errorf("%s: unexpected type %T", fullPath, updatedObj))
+				addToResult(&errs, namespace, errors.Errorf("unexpected type %T for item %q for resource %q in namespace %q", updatedObj, file, resource, namespace))
 				continue
 			}
 
@@ -812,7 +769,7 @@ func (ctx *context) restoreResource(resource, namespace, resourcePath string) (a
 		// Error was something other than an AlreadyExists
 		if restoreErr != nil {
 			ctx.log.Infof("error restoring %s: %v", name, err)
-			addToResult(&errs, namespace, fmt.Errorf("error restoring %s: %v", fullPath, restoreErr))
+			addToResult(&errs, namespace, errors.Wrapf(restoreErr, "error restoring item %q for resource %q in namespace %q", file, resource, namespace))
 			continue
 		}
 
@@ -1042,89 +999,4 @@ func isCompleted(obj *unstructured.Unstructured, groupResource schema.GroupResou
 	}
 	// Assume any other resource isn't complete and can be restored
 	return false, nil
-}
-
-// unmarshal reads the specified file, unmarshals the JSON contained within it
-// and returns an Unstructured object.
-func (ctx *context) unmarshal(filePath string) (*unstructured.Unstructured, error) {
-	var obj unstructured.Unstructured
-
-	bytes, err := ctx.fileSystem.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal(bytes, &obj)
-	if err != nil {
-		return nil, err
-	}
-
-	return &obj, nil
-}
-
-// unzipAndExtractBackup extracts a reader on a gzipped tarball to a local temp directory
-func (ctx *context) unzipAndExtractBackup(src io.Reader) (string, error) {
-	gzr, err := gzip.NewReader(src)
-	if err != nil {
-		ctx.log.Infof("error creating gzip reader: %v", err)
-		return "", err
-	}
-	defer gzr.Close()
-
-	return ctx.readBackup(tar.NewReader(gzr))
-}
-
-// readBackup extracts a tar reader to a local directory/file tree within a
-// temp directory.
-func (ctx *context) readBackup(tarRdr *tar.Reader) (string, error) {
-	dir, err := ctx.fileSystem.TempDir("", "")
-	if err != nil {
-		ctx.log.Infof("error creating temp dir: %v", err)
-		return "", err
-	}
-
-	for {
-		header, err := tarRdr.Next()
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			ctx.log.Infof("error reading tar: %v", err)
-			return "", err
-		}
-
-		target := filepath.Join(dir, header.Name)
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			err := ctx.fileSystem.MkdirAll(target, header.FileInfo().Mode())
-			if err != nil {
-				ctx.log.Infof("mkdirall error: %v", err)
-				return "", err
-			}
-
-		case tar.TypeReg:
-			// make sure we have the directory created
-			err := ctx.fileSystem.MkdirAll(filepath.Dir(target), header.FileInfo().Mode())
-			if err != nil {
-				ctx.log.Infof("mkdirall error: %v", err)
-				return "", err
-			}
-
-			// create the file
-			file, err := ctx.fileSystem.Create(target)
-			if err != nil {
-				return "", err
-			}
-			defer file.Close()
-
-			if _, err := io.Copy(file, tarRdr); err != nil {
-				ctx.log.Infof("error copying: %v", err)
-				return "", err
-			}
-		}
-	}
-
-	return dir, nil
 }
