@@ -37,7 +37,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/backup"
+	pkgbackup "github.com/heptio/ark/pkg/backup"
 	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
 	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
 	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
@@ -55,7 +55,7 @@ const backupVersion = 1
 type backupController struct {
 	*genericController
 
-	backupper                backup.Backupper
+	backupper                pkgbackup.Backupper
 	lister                   listers.BackupLister
 	client                   arkv1client.BackupsGetter
 	clock                    clock.Clock
@@ -65,7 +65,7 @@ type backupController struct {
 	backupLocationLister     listers.BackupStorageLocationLister
 	defaultBackupLocation    string
 	snapshotLocationLister   listers.VolumeSnapshotLocationLister
-	defaultSnapshotLocations map[string]string
+	defaultSnapshotLocations map[string]*api.VolumeSnapshotLocation
 	metrics                  *metrics.ServerMetrics
 	newBackupStore           func(*api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error)
 }
@@ -73,7 +73,7 @@ type backupController struct {
 func NewBackupController(
 	backupInformer informers.BackupInformer,
 	client arkv1client.BackupsGetter,
-	backupper backup.Backupper,
+	backupper pkgbackup.Backupper,
 	logger logrus.FieldLogger,
 	backupLogLevel logrus.Level,
 	newPluginManager func(logrus.FieldLogger) plugin.Manager,
@@ -81,7 +81,7 @@ func NewBackupController(
 	backupLocationInformer informers.BackupStorageLocationInformer,
 	defaultBackupLocation string,
 	volumeSnapshotLocationInformer informers.VolumeSnapshotLocationInformer,
-	defaultSnapshotLocations map[string]string,
+	defaultSnapshotLocations map[string]*api.VolumeSnapshotLocation,
 	metrics *metrics.ServerMetrics,
 ) Interface {
 	c := &backupController{
@@ -148,7 +148,7 @@ func (c *backupController) processBackup(key string) error {
 	}
 
 	log.Debug("Getting backup")
-	backup, err := c.lister.Backups(ns).Get(name)
+	original, err := c.lister.Backups(ns).Get(name)
 	if err != nil {
 		return errors.Wrap(err, "error getting backup")
 	}
@@ -161,7 +161,7 @@ func (c *backupController) processBackup(key string) error {
 	// informer sees the update. In the latter case, after the informer has seen the update to
 	// InProgress, we still need this check so we can return nil to indicate we've finished processing
 	// this key (even though it was a no-op).
-	switch backup.Status.Phase {
+	switch original.Status.Phase {
 	case "", api.BackupPhaseNew:
 		// only process new backups
 	default:
@@ -169,60 +169,58 @@ func (c *backupController) processBackup(key string) error {
 	}
 
 	log.Debug("Cloning backup")
-	// store ref to original for creating patch
-	original := backup
-	// don't modify items in the cache
-	backup = backup.DeepCopy()
-
-	// set backup version
-	backup.Status.Version = backupVersion
-
-	// calculate expiration
-	if backup.Spec.TTL.Duration > 0 {
-		backup.Status.Expiration = metav1.NewTime(c.clock.Now().Add(backup.Spec.TTL.Duration))
+	request := &pkgbackup.Request{
+		Backup: original.DeepCopy(), // don't modify items in the cache
 	}
 
-	backupLocation, errs := c.getLocationAndValidate(backup, c.defaultBackupLocation)
-	errs = append(errs, c.defaultAndValidateSnapshotLocations(backup, c.defaultSnapshotLocations)...)
-	backup.Status.ValidationErrors = append(backup.Status.ValidationErrors, errs...)
+	// set backup version
+	request.Status.Version = backupVersion
 
-	if len(backup.Status.ValidationErrors) > 0 {
-		backup.Status.Phase = api.BackupPhaseFailedValidation
+	// calculate expiration
+	if request.Spec.TTL.Duration > 0 {
+		request.Status.Expiration = metav1.NewTime(c.clock.Now().Add(request.Spec.TTL.Duration))
+	}
+
+	request.Status.ValidationErrors = append(request.Status.ValidationErrors, c.getLocationAndValidate(request, c.defaultBackupLocation)...)
+	request.Status.ValidationErrors = append(request.Status.ValidationErrors, c.defaultAndValidateSnapshotLocations(request, c.defaultSnapshotLocations)...)
+
+	if len(request.Status.ValidationErrors) > 0 {
+		request.Status.Phase = api.BackupPhaseFailedValidation
 	} else {
-		backup.Status.Phase = api.BackupPhaseInProgress
+		request.Status.Phase = api.BackupPhaseInProgress
 	}
 
 	// update status
-	updatedBackup, err := patchBackup(original, backup, c.client)
+	updatedBackup, err := patchBackup(original, request.Backup, c.client)
 	if err != nil {
-		return errors.Wrapf(err, "error updating Backup status to %s", backup.Status.Phase)
+		return errors.Wrapf(err, "error updating Backup status to %s", request.Status.Phase)
 	}
 	// store ref to just-updated item for creating patch
 	original = updatedBackup
-	backup = updatedBackup.DeepCopy()
+	request.Backup = updatedBackup.DeepCopy()
 
-	if backup.Status.Phase == api.BackupPhaseFailedValidation {
+	if request.Status.Phase == api.BackupPhaseFailedValidation {
 		return nil
 	}
 
-	c.backupTracker.Add(backup.Namespace, backup.Name)
-	defer c.backupTracker.Delete(backup.Namespace, backup.Name)
+	c.backupTracker.Add(request.Namespace, request.Name)
+	defer c.backupTracker.Delete(request.Namespace, request.Name)
 
 	log.Debug("Running backup")
 	// execution & upload of backup
-	backupScheduleName := backup.GetLabels()["ark-schedule"]
+	backupScheduleName := request.GetLabels()["ark-schedule"]
 	c.metrics.RegisterBackupAttempt(backupScheduleName)
 
-	if err := c.runBackup(backup, backupLocation); err != nil {
+	if err := c.runBackup(request); err != nil {
 		log.WithError(err).Error("backup failed")
-		backup.Status.Phase = api.BackupPhaseFailed
+		request.Status.Phase = api.BackupPhaseFailed
 		c.metrics.RegisterBackupFailed(backupScheduleName)
 	} else {
 		c.metrics.RegisterBackupSuccess(backupScheduleName)
 	}
 
 	log.Debug("Updating backup's final status")
-	if _, err := patchBackup(original, backup, c.client); err != nil {
+	if _, err := patchBackup(original, request.Backup, c.client); err != nil {
 		log.WithError(err).Error("error updating backup's final status")
 	}
 
@@ -253,7 +251,7 @@ func patchBackup(original, updated *api.Backup, client arkv1client.BackupsGetter
 	return res, nil
 }
 
-func (c *backupController) getLocationAndValidate(itm *api.Backup, defaultBackupLocation string) (*api.BackupStorageLocation, []string) {
+func (c *backupController) getLocationAndValidate(itm *pkgbackup.Request, defaultBackupLocation string) []string {
 	var validationErrors []string
 
 	for _, err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedResources, itm.Spec.ExcludedResources) {
@@ -274,23 +272,23 @@ func (c *backupController) getLocationAndValidate(itm *api.Backup, defaultBackup
 	}
 	itm.Labels[api.StorageLocationLabel] = itm.Spec.StorageLocation
 
-	var backupLocation *api.BackupStorageLocation
-	backupLocation, err := c.backupLocationLister.BackupStorageLocations(itm.Namespace).Get(itm.Spec.StorageLocation)
-	if err != nil {
+	if storageLocation, err := c.backupLocationLister.BackupStorageLocations(itm.Namespace).Get(itm.Spec.StorageLocation); err != nil {
 		validationErrors = append(validationErrors, fmt.Sprintf("Error getting backup storage location: %v", err))
+	} else {
+		itm.StorageLocation = storageLocation
 	}
 
-	return backupLocation, validationErrors
+	return validationErrors
 }
 
 // defaultAndValidateSnapshotLocations ensures:
 // - each location name in Spec VolumeSnapshotLocation exists as a location
 // - exactly 1 location per existing or default provider
 // - a given default provider's location name is added to the Spec VolumeSnapshotLocation if it does not exist as a VSL
-func (c *backupController) defaultAndValidateSnapshotLocations(itm *api.Backup, defaultLocations map[string]string) []string {
-	var errors []string
-	perProviderLocationName := make(map[string]string)
-	var finalLocationNameList []string
+func (c *backupController) defaultAndValidateSnapshotLocations(itm *pkgbackup.Request, defaultLocations map[string]*api.VolumeSnapshotLocation) []string {
+	errors := []string{}
+	providerLocations := make(map[string]*api.VolumeSnapshotLocation)
+
 	for _, locationName := range itm.Spec.VolumeSnapshotLocations {
 		// validate each locationName exists as a VolumeSnapshotLocation
 		location, err := c.snapshotLocationLister.VolumeSnapshotLocations(itm.Namespace).Get(locationName)
@@ -299,19 +297,16 @@ func (c *backupController) defaultAndValidateSnapshotLocations(itm *api.Backup, 
 			continue
 		}
 
-		// ensure we end up with exactly 1 locationName *per provider*
-		providerLocationName := perProviderLocationName[location.Spec.Provider]
-		if providerLocationName != "" {
+		// ensure we end up with exactly 1 location *per provider*
+		if providerLocation, ok := providerLocations[location.Spec.Provider]; ok {
 			// if > 1 location name per provider as in ["aws-us-east-1" | "aws-us-west-1"] (same provider, multiple names)
-			if providerLocationName != locationName {
-				errors = append(errors, fmt.Sprintf("more than one VolumeSnapshotLocation name specified for provider %s: %s; unexpected name was %s", location.Spec.Provider, locationName, providerLocationName))
+			if providerLocation.Name != locationName {
+				errors = append(errors, fmt.Sprintf("more than one VolumeSnapshotLocation name specified for provider %s: %s; unexpected name was %s", location.Spec.Provider, locationName, providerLocation.Name))
 				continue
 			}
 		} else {
-			// no dup exists: add locationName to the final list
-			finalLocationNameList = append(finalLocationNameList, locationName)
 			// keep track of all valid existing locations, per provider
-			perProviderLocationName[location.Spec.Provider] = locationName
+			providerLocations[location.Spec.Provider] = location
 		}
 	}
 
@@ -319,18 +314,23 @@ func (c *backupController) defaultAndValidateSnapshotLocations(itm *api.Backup, 
 		return errors
 	}
 
-	for provider, defaultLocationName := range defaultLocations {
+	for provider, defaultLocation := range defaultLocations {
 		// if a location name for a given provider does not already exist, add the provider's default
-		if _, ok := perProviderLocationName[provider]; !ok {
-			finalLocationNameList = append(finalLocationNameList, defaultLocationName)
+		if _, ok := providerLocations[provider]; !ok {
+			providerLocations[provider] = defaultLocation
 		}
 	}
-	itm.Spec.VolumeSnapshotLocations = finalLocationNameList
+
+	itm.Spec.VolumeSnapshotLocations = []string{}
+	for _, loc := range providerLocations {
+		itm.Spec.VolumeSnapshotLocations = append(itm.Spec.VolumeSnapshotLocations, loc.Name)
+		itm.SnapshotLocations = append(itm.SnapshotLocations, loc)
+	}
 
 	return nil
 }
 
-func (c *backupController) runBackup(backup *api.Backup, backupLocation *api.BackupStorageLocation) error {
+func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 	log := c.logger.WithField("backup", kubeutil.NamespaceAndName(backup))
 	log.Info("Starting backup")
 	backup.Status.StartTimestamp.Time = c.clock.Now()
@@ -367,18 +367,15 @@ func (c *backupController) runBackup(backup *api.Backup, backupLocation *api.Bac
 		return err
 	}
 
-	backupStore, err := c.newBackupStore(backupLocation, pluginManager, log)
+	backupStore, err := c.newBackupStore(backup.StorageLocation, pluginManager, log)
 	if err != nil {
 		return err
 	}
 
 	var errs []error
 
-	var backupJSONToUpload, backupFileToUpload io.Reader
-
 	// Do the actual backup
-	// TODO need to pass the VolumeSnapshotLocations down here
-	if err := c.backupper.Backup(log, backup, backupFile, actions, nil, pluginManager); err != nil {
+	if err := c.backupper.Backup(log, backup, backupFile, actions, pluginManager); err != nil {
 		errs = append(errs, err)
 
 		backup.Status.Phase = api.BackupPhaseFailed
@@ -390,6 +387,7 @@ func (c *backupController) runBackup(backup *api.Backup, backupLocation *api.Bac
 	// Otherwise, the JSON file in object storage has a CompletionTimestamp of 'null'.
 	backup.Status.CompletionTimestamp.Time = c.clock.Now()
 
+	var backupJSONToUpload, backupFileToUpload io.Reader
 	backupJSON := new(bytes.Buffer)
 	if err := encode.EncodeTo(backup, "json", backupJSON); err != nil {
 		errs = append(errs, errors.Wrap(err, "error encoding backup"))

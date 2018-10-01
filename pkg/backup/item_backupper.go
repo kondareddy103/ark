@@ -40,23 +40,18 @@ import (
 	"github.com/heptio/ark/pkg/kuberesource"
 	"github.com/heptio/ark/pkg/podexec"
 	"github.com/heptio/ark/pkg/restic"
-	"github.com/heptio/ark/pkg/util/collections"
 )
 
 type itemBackupperFactory interface {
 	newItemBackupper(
-		backup *api.Backup,
-		namespaces, resources *collections.IncludesExcludes,
+		backup *Request,
 		backedUpItems map[itemKey]struct{},
-		actions []resolvedAction,
 		podCommandExecutor podexec.PodCommandExecutor,
 		tarWriter tarWriter,
-		resourceHooks []resourceHook,
 		dynamicFactory client.DynamicFactory,
 		discoveryHelper discovery.Helper,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		snapshotLocations []*api.VolumeSnapshotLocation,
 		blockStoreGetter blockStoreGetter,
 	) ItemBackupper
 }
@@ -64,33 +59,24 @@ type itemBackupperFactory interface {
 type defaultItemBackupperFactory struct{}
 
 func (f *defaultItemBackupperFactory) newItemBackupper(
-	backup *api.Backup,
-	namespaces, resources *collections.IncludesExcludes,
+	backup *Request,
 	backedUpItems map[itemKey]struct{},
-	actions []resolvedAction,
 	podCommandExecutor podexec.PodCommandExecutor,
 	tarWriter tarWriter,
-	resourceHooks []resourceHook,
 	dynamicFactory client.DynamicFactory,
 	discoveryHelper discovery.Helper,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	snapshotLocations []*api.VolumeSnapshotLocation,
 	blockStoreGetter blockStoreGetter,
 ) ItemBackupper {
 	ib := &defaultItemBackupper{
 		backup:                backup,
-		namespaces:            namespaces,
-		resources:             resources,
 		backedUpItems:         backedUpItems,
-		actions:               actions,
 		tarWriter:             tarWriter,
-		resourceHooks:         resourceHooks,
 		dynamicFactory:        dynamicFactory,
 		discoveryHelper:       discoveryHelper,
 		resticBackupper:       resticBackupper,
 		resticSnapshotTracker: resticSnapshotTracker,
-		snapshotLocations:     snapshotLocations,
 		blockStoreGetter:      blockStoreGetter,
 
 		itemHookHandler: &defaultItemHookHandler{
@@ -109,18 +95,13 @@ type ItemBackupper interface {
 }
 
 type defaultItemBackupper struct {
-	backup                *api.Backup
-	namespaces            *collections.IncludesExcludes
-	resources             *collections.IncludesExcludes
+	backup                *Request
 	backedUpItems         map[itemKey]struct{}
-	actions               []resolvedAction
 	tarWriter             tarWriter
-	resourceHooks         []resourceHook
 	dynamicFactory        client.DynamicFactory
 	discoveryHelper       discovery.Helper
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
-	snapshotLocations     []*api.VolumeSnapshotLocation
 	blockStoreGetter      blockStoreGetter
 
 	itemHookHandler             itemHookHandler
@@ -146,7 +127,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 
 	// NOTE: we have to re-check namespace & resource includes/excludes because it's possible that
 	// backupItem can be invoked by a custom action.
-	if namespace != "" && !ib.namespaces.ShouldInclude(namespace) {
+	if namespace != "" && !ib.backup.NamespaceIncludesExcludes.ShouldInclude(namespace) {
 		log.Info("Excluding item because namespace is excluded")
 		return nil
 	}
@@ -158,7 +139,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 		return nil
 	}
 
-	if !ib.resources.ShouldInclude(groupResource.String()) {
+	if !ib.backup.ResourceIncludesExcludes.ShouldInclude(groupResource.String()) {
 		log.Info("Excluding item because resource is excluded")
 		return nil
 	}
@@ -182,7 +163,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	log.Info("Backing up resource")
 
 	log.Debug("Executing pre hooks")
-	if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.resourceHooks, hookPhasePre); err != nil {
+	if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.backup.ResourceHooks, hookPhasePre); err != nil {
 		return err
 	}
 
@@ -216,7 +197,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 
 		// if there was an error running actions, execute post hooks and return
 		log.Debug("Executing post hooks")
-		if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.resourceHooks, hookPhasePost); err != nil {
+		if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.backup.ResourceHooks, hookPhasePost); err != nil {
 			backupErrs = append(backupErrs, err)
 		}
 
@@ -228,7 +209,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	}
 
 	if groupResource == kuberesource.PersistentVolumes {
-		if err := ib.takePVSnapshot(obj, ib.backup, log); err != nil {
+		if err := ib.takePVSnapshot(obj, log); err != nil {
 			backupErrs = append(backupErrs, err)
 		}
 	}
@@ -247,7 +228,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	}
 
 	log.Debug("Executing post hooks")
-	if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.resourceHooks, hookPhasePost); err != nil {
+	if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.backup.ResourceHooks, hookPhasePost); err != nil {
 		backupErrs = append(backupErrs, err)
 	}
 
@@ -298,7 +279,7 @@ func (ib *defaultItemBackupper) backupPodVolumes(log logrus.FieldLogger, pod *co
 		return nil, nil
 	}
 
-	return ib.resticBackupper.BackupPodVolumes(ib.backup, pod, log)
+	return ib.resticBackupper.BackupPodVolumes(ib.backup.Backup, pod, log)
 }
 
 func (ib *defaultItemBackupper) executeActions(
@@ -308,7 +289,7 @@ func (ib *defaultItemBackupper) executeActions(
 	name, namespace string,
 	metadata metav1.Object,
 ) (runtime.Unstructured, error) {
-	for _, action := range ib.actions {
+	for _, action := range ib.backup.ResolvedActions {
 		if !action.resourceIncludesExcludes.ShouldInclude(groupResource.String()) {
 			log.Debug("Skipping action because it does not apply to this resource")
 			continue
@@ -326,7 +307,7 @@ func (ib *defaultItemBackupper) executeActions(
 
 		log.Info("Executing custom action")
 
-		updatedItem, additionalItemIdentifiers, err := action.Execute(obj, ib.backup)
+		updatedItem, additionalItemIdentifiers, err := action.Execute(obj, ib.backup.Backup)
 		if err != nil {
 			// We want this to show up in the log file at the place where the error occurs. When we return
 			// the error, it get aggregated with all the other ones at the end of the backup, making it
@@ -393,10 +374,10 @@ const zoneLabel = "failure-domain.beta.kubernetes.io/zone"
 // takePVSnapshot triggers a snapshot for the volume/disk underlying a PersistentVolume if the provided
 // backup has volume snapshots enabled and the PV is of a compatible type. Also records cloud
 // disk type and IOPS (if applicable) to be able to restore to current state later.
-func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, backup *api.Backup, log logrus.FieldLogger) error {
+func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, log logrus.FieldLogger) error {
 	log.Info("Executing takePVSnapshot")
 
-	if backup.Spec.SnapshotVolumes != nil && !*backup.Spec.SnapshotVolumes {
+	if ib.backup.Spec.SnapshotVolumes != nil && !*ib.backup.Spec.SnapshotVolumes {
 		log.Info("Backup has volume snapshots disabled; skipping volume snapshot action.")
 		return nil
 	}
@@ -435,7 +416,7 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, backup 
 		blockStore cloudprovider.BlockStore
 	)
 
-	for _, snapshotLocation := range ib.snapshotLocations {
+	for _, snapshotLocation := range ib.backup.SnapshotLocations {
 		bs, err := ib.getBlockStore(snapshotLocation)
 		if err != nil {
 			log.WithError(err).WithField("volumeSnapshotLocation", snapshotLocation).Error("Error getting block store for volume snapshot location")
@@ -469,7 +450,7 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, backup 
 	log = log.WithField("volumeID", volumeID)
 
 	tags := map[string]string{
-		"ark.heptio.com/backup": backup.Name,
+		"ark.heptio.com/backup": ib.backup.Name,
 		"ark.heptio.com/pv":     metadata.GetName(),
 	}
 
@@ -487,11 +468,11 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, backup 
 		return errors.WithMessage(err, "error getting volume info")
 	}
 
-	if backup.Status.VolumeBackups == nil {
-		backup.Status.VolumeBackups = make(map[string]*api.VolumeBackupInfo)
+	if ib.backup.Status.VolumeBackups == nil {
+		ib.backup.Status.VolumeBackups = make(map[string]*api.VolumeBackupInfo)
 	}
 
-	backup.Status.VolumeBackups[name] = &api.VolumeBackupInfo{
+	ib.backup.Status.VolumeBackups[name] = &api.VolumeBackupInfo{
 		SnapshotID:       snapshotID,
 		Type:             volumeType,
 		Iops:             iops,

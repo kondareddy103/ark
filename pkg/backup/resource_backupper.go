@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kuberrs "k8s.io/apimachinery/pkg/util/errors"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/discovery"
 	"github.com/heptio/ark/pkg/kuberesource"
@@ -39,20 +38,15 @@ import (
 type resourceBackupperFactory interface {
 	newResourceBackupper(
 		log logrus.FieldLogger,
-		backup *api.Backup,
-		namespaces *collections.IncludesExcludes,
-		resources *collections.IncludesExcludes,
+		backup *Request,
 		dynamicFactory client.DynamicFactory,
 		discoveryHelper discovery.Helper,
 		backedUpItems map[itemKey]struct{},
 		cohabitatingResources map[string]*cohabitatingResource,
-		actions []resolvedAction,
 		podCommandExecutor podexec.PodCommandExecutor,
 		tarWriter tarWriter,
-		resourceHooks []resourceHook,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		snapshotLocations []*api.VolumeSnapshotLocation,
 		blockStoreGetter blockStoreGetter,
 	) resourceBackupper
 }
@@ -61,38 +55,28 @@ type defaultResourceBackupperFactory struct{}
 
 func (f *defaultResourceBackupperFactory) newResourceBackupper(
 	log logrus.FieldLogger,
-	backup *api.Backup,
-	namespaces *collections.IncludesExcludes,
-	resources *collections.IncludesExcludes,
+	backup *Request,
 	dynamicFactory client.DynamicFactory,
 	discoveryHelper discovery.Helper,
 	backedUpItems map[itemKey]struct{},
 	cohabitatingResources map[string]*cohabitatingResource,
-	actions []resolvedAction,
 	podCommandExecutor podexec.PodCommandExecutor,
 	tarWriter tarWriter,
-	resourceHooks []resourceHook,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	snapshotLocations []*api.VolumeSnapshotLocation,
 	blockStoreGetter blockStoreGetter,
 ) resourceBackupper {
 	return &defaultResourceBackupper{
 		log:                   log,
 		backup:                backup,
-		namespaces:            namespaces,
-		resources:             resources,
 		dynamicFactory:        dynamicFactory,
 		discoveryHelper:       discoveryHelper,
 		backedUpItems:         backedUpItems,
-		actions:               actions,
 		cohabitatingResources: cohabitatingResources,
 		podCommandExecutor:    podCommandExecutor,
 		tarWriter:             tarWriter,
-		resourceHooks:         resourceHooks,
 		resticBackupper:       resticBackupper,
 		resticSnapshotTracker: resticSnapshotTracker,
-		snapshotLocations:     snapshotLocations,
 		blockStoreGetter:      blockStoreGetter,
 
 		itemBackupperFactory: &defaultItemBackupperFactory{},
@@ -105,21 +89,16 @@ type resourceBackupper interface {
 
 type defaultResourceBackupper struct {
 	log                   logrus.FieldLogger
-	backup                *api.Backup
-	namespaces            *collections.IncludesExcludes
-	resources             *collections.IncludesExcludes
+	backup                *Request
 	dynamicFactory        client.DynamicFactory
 	discoveryHelper       discovery.Helper
 	backedUpItems         map[itemKey]struct{}
 	cohabitatingResources map[string]*cohabitatingResource
-	actions               []resolvedAction
 	podCommandExecutor    podexec.PodCommandExecutor
 	tarWriter             tarWriter
-	resourceHooks         []resourceHook
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
 	itemBackupperFactory  itemBackupperFactory
-	snapshotLocations     []*api.VolumeSnapshotLocation
 	blockStoreGetter      blockStoreGetter
 }
 
@@ -147,7 +126,7 @@ func (rb *defaultResourceBackupper) backupResource(
 	// we should include it based on the IncludeClusterResources setting.
 	if gr != kuberesource.Namespaces && clusterScoped {
 		if rb.backup.Spec.IncludeClusterResources == nil {
-			if !rb.namespaces.IncludeEverything() {
+			if !rb.backup.NamespaceIncludesExcludes.IncludeEverything() {
 				// when IncludeClusterResources == nil (auto), only directly
 				// back up cluster-scoped resources if we're doing a full-cluster
 				// (all namespaces) backup. Note that in the case of a subset of
@@ -164,7 +143,7 @@ func (rb *defaultResourceBackupper) backupResource(
 		}
 	}
 
-	if !rb.resources.ShouldInclude(grString) {
+	if !rb.backup.ResourceIncludesExcludes.ShouldInclude(grString) {
 		log.Infof("Resource is excluded")
 		return nil
 	}
@@ -184,22 +163,17 @@ func (rb *defaultResourceBackupper) backupResource(
 
 	itemBackupper := rb.itemBackupperFactory.newItemBackupper(
 		rb.backup,
-		rb.namespaces,
-		rb.resources,
 		rb.backedUpItems,
-		rb.actions,
 		rb.podCommandExecutor,
 		rb.tarWriter,
-		rb.resourceHooks,
 		rb.dynamicFactory,
 		rb.discoveryHelper,
 		rb.resticBackupper,
 		rb.resticSnapshotTracker,
-		rb.snapshotLocations,
 		rb.blockStoreGetter,
 	)
 
-	namespacesToList := getNamespacesToList(rb.namespaces)
+	namespacesToList := getNamespacesToList(rb.backup.NamespaceIncludesExcludes)
 
 	// Check if we're backing up namespaces, and only certain ones
 	if gr == kuberesource.Namespaces && namespacesToList[0] != "" {
@@ -281,7 +255,7 @@ func (rb *defaultResourceBackupper) backupResource(
 				continue
 			}
 
-			if gr == kuberesource.Namespaces && !rb.namespaces.ShouldInclude(metadata.GetName()) {
+			if gr == kuberesource.Namespaces && !rb.backup.NamespaceIncludesExcludes.ShouldInclude(metadata.GetName()) {
 				log.WithField("name", metadata.GetName()).Info("skipping namespace because it is excluded")
 				continue
 			}

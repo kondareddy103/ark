@@ -46,7 +46,7 @@ import (
 type Backupper interface {
 	// Backup takes a backup using the specification in the api.Backup and writes backup and log data
 	// to the given writers.
-	Backup(logger logrus.FieldLogger, backup *api.Backup, backupFile io.Writer, actions []ItemAction, snapshotLocations []*api.VolumeSnapshotLocation, blockStoreGetter blockStoreGetter) error
+	Backup(logger logrus.FieldLogger, backup *Request, backupFile io.Writer, actions []ItemAction, blockStoreGetter blockStoreGetter) error
 }
 
 // kubernetesBackupper implements Backupper.
@@ -212,14 +212,7 @@ type blockStoreGetter interface {
 
 // Backup backs up the items specified in the Backup, placing them in a gzip-compressed tar file
 // written to backupFile. The finalized api.Backup is written to metadata.
-func (kb *kubernetesBackupper) Backup(
-	logger logrus.FieldLogger,
-	backup *api.Backup,
-	backupFile io.Writer,
-	actions []ItemAction,
-	snapshotLocations []*api.VolumeSnapshotLocation,
-	blockStoreGetter blockStoreGetter,
-) error {
+func (kb *kubernetesBackupper) Backup(logger logrus.FieldLogger, backup *Request, backupFile io.Writer, actions []ItemAction, blockStoreGetter blockStoreGetter) error {
 	gzippedData := gzip.NewWriter(backupFile)
 	defer gzippedData.Close()
 
@@ -229,23 +222,21 @@ func (kb *kubernetesBackupper) Backup(
 	log := logger.WithField("backup", kubeutil.NamespaceAndName(backup))
 	log.Info("Starting backup")
 
-	namespaceIncludesExcludes := getNamespaceIncludesExcludes(backup)
-	log.Infof("Including namespaces: %s", namespaceIncludesExcludes.IncludesString())
-	log.Infof("Excluding namespaces: %s", namespaceIncludesExcludes.ExcludesString())
+	backup.NamespaceIncludesExcludes = getNamespaceIncludesExcludes(backup.Backup)
+	log.Infof("Including namespaces: %s", backup.NamespaceIncludesExcludes.IncludesString())
+	log.Infof("Excluding namespaces: %s", backup.NamespaceIncludesExcludes.ExcludesString())
 
-	resourceIncludesExcludes := getResourceIncludesExcludes(kb.discoveryHelper, backup.Spec.IncludedResources, backup.Spec.ExcludedResources)
-	log.Infof("Including resources: %s", resourceIncludesExcludes.IncludesString())
-	log.Infof("Excluding resources: %s", resourceIncludesExcludes.ExcludesString())
+	backup.ResourceIncludesExcludes = getResourceIncludesExcludes(kb.discoveryHelper, backup.Spec.IncludedResources, backup.Spec.ExcludedResources)
+	log.Infof("Including resources: %s", backup.ResourceIncludesExcludes.IncludesString())
+	log.Infof("Excluding resources: %s", backup.ResourceIncludesExcludes.ExcludesString())
 
-	resourceHooks, err := getResourceHooks(backup.Spec.Hooks.Resources, kb.discoveryHelper)
+	var err error
+	backup.ResourceHooks, err = getResourceHooks(backup.Spec.Hooks.Resources, kb.discoveryHelper)
 	if err != nil {
 		return err
 	}
 
-	backedUpItems := make(map[itemKey]struct{})
-	var errs []error
-
-	resolvedActions, err := resolveActions(actions, kb.discoveryHelper)
+	backup.ResolvedActions, err = resolveActions(actions, kb.discoveryHelper)
 	if err != nil {
 		return err
 	}
@@ -265,7 +256,7 @@ func (kb *kubernetesBackupper) Backup(
 
 	var resticBackupper restic.Backupper
 	if kb.resticBackupperFactory != nil {
-		resticBackupper, err = kb.resticBackupperFactory.NewBackupper(ctx, backup)
+		resticBackupper, err = kb.resticBackupperFactory.NewBackupper(ctx, backup.Backup)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -274,22 +265,18 @@ func (kb *kubernetesBackupper) Backup(
 	gb := kb.groupBackupperFactory.newGroupBackupper(
 		log,
 		backup,
-		namespaceIncludesExcludes,
-		resourceIncludesExcludes,
 		kb.dynamicFactory,
 		kb.discoveryHelper,
-		backedUpItems,
+		make(map[itemKey]struct{}),
 		cohabitatingResources(),
-		resolvedActions,
 		kb.podCommandExecutor,
 		tw,
-		resourceHooks,
 		resticBackupper,
 		newPVCSnapshotTracker(),
-		snapshotLocations,
 		blockStoreGetter,
 	)
 
+	var errs []error
 	for _, group := range kb.discoveryHelper.Resources() {
 		if err := gb.backupGroup(group); err != nil {
 			errs = append(errs, err)

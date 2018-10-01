@@ -668,7 +668,7 @@ func (s *server) runControllers(
 			s.sharedInformerFactory.Ark().V1().BackupStorageLocations(),
 			s.config.defaultBackupLocation,
 			s.sharedInformerFactory.Ark().V1().VolumeSnapshotLocations(),
-			s.config.defaultVolumeSnapshotLocations,
+			defaultVolumeSnapshotLocations,
 			s.metrics,
 		)
 		wg.Add(1)
