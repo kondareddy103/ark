@@ -321,7 +321,7 @@ func (c *backupController) defaultAndValidateSnapshotLocations(itm *pkgbackup.Re
 		}
 	}
 
-	itm.Spec.VolumeSnapshotLocations = []string{}
+	itm.Spec.VolumeSnapshotLocations = nil
 	for _, loc := range providerLocations {
 		itm.Spec.VolumeSnapshotLocations = append(itm.Spec.VolumeSnapshotLocations, loc.Name)
 		itm.SnapshotLocations = append(itm.SnapshotLocations, loc)
@@ -389,7 +389,7 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 
 	var backupJSONToUpload, backupFileToUpload io.Reader
 	backupJSON := new(bytes.Buffer)
-	if err := encode.EncodeTo(backup, "json", backupJSON); err != nil {
+	if err := encode.EncodeTo(backup.Backup, "json", backupJSON); err != nil {
 		errs = append(errs, errors.Wrap(err, "error encoding backup"))
 	} else {
 		// Only upload the json and backup tarball if encoding to json succeeded.

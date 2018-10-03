@@ -47,7 +47,7 @@ type resourceBackupperFactory interface {
 		tarWriter tarWriter,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		blockStoreGetter blockStoreGetter,
+		blockStoreGetter BlockStoreGetter,
 	) resourceBackupper
 }
 
@@ -64,7 +64,7 @@ func (f *defaultResourceBackupperFactory) newResourceBackupper(
 	tarWriter tarWriter,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	blockStoreGetter blockStoreGetter,
+	blockStoreGetter BlockStoreGetter,
 ) resourceBackupper {
 	return &defaultResourceBackupper{
 		log:                   log,
@@ -99,7 +99,7 @@ type defaultResourceBackupper struct {
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
 	itemBackupperFactory  itemBackupperFactory
-	blockStoreGetter      blockStoreGetter
+	blockStoreGetter      BlockStoreGetter
 }
 
 // backupResource backs up all the objects for a given group-version-resource.

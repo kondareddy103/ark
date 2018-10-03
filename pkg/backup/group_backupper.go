@@ -45,7 +45,7 @@ type groupBackupperFactory interface {
 		tarWriter tarWriter,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		blockStoreGetter blockStoreGetter,
+		blockStoreGetter BlockStoreGetter,
 	) groupBackupper
 }
 
@@ -62,7 +62,7 @@ func (f *defaultGroupBackupperFactory) newGroupBackupper(
 	tarWriter tarWriter,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	blockStoreGetter blockStoreGetter,
+	blockStoreGetter BlockStoreGetter,
 ) groupBackupper {
 	return &defaultGroupBackupper{
 		log:                   log,
@@ -97,7 +97,7 @@ type defaultGroupBackupper struct {
 	resticBackupper          restic.Backupper
 	resticSnapshotTracker    *pvcSnapshotTracker
 	resourceBackupperFactory resourceBackupperFactory
-	blockStoreGetter         blockStoreGetter
+	blockStoreGetter         BlockStoreGetter
 }
 
 // backupGroup backs up a single API group.

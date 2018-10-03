@@ -52,7 +52,7 @@ type itemBackupperFactory interface {
 		discoveryHelper discovery.Helper,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		blockStoreGetter blockStoreGetter,
+		blockStoreGetter BlockStoreGetter,
 	) ItemBackupper
 }
 
@@ -67,7 +67,7 @@ func (f *defaultItemBackupperFactory) newItemBackupper(
 	discoveryHelper discovery.Helper,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	blockStoreGetter blockStoreGetter,
+	blockStoreGetter BlockStoreGetter,
 ) ItemBackupper {
 	ib := &defaultItemBackupper{
 		backup:                backup,
@@ -102,7 +102,7 @@ type defaultItemBackupper struct {
 	discoveryHelper       discovery.Helper
 	resticBackupper       restic.Backupper
 	resticSnapshotTracker *pvcSnapshotTracker
-	blockStoreGetter      blockStoreGetter
+	blockStoreGetter      BlockStoreGetter
 
 	itemHookHandler             itemHookHandler
 	additionalItemBackupper     ItemBackupper
@@ -424,7 +424,7 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, log log
 		}
 
 		log := log.WithFields(map[string]interface{}{
-			"volumeSnapshotLocation": snapshotLocation,
+			"volumeSnapshotLocation": snapshotLocation.Name,
 			"persistentVolume":       metadata.GetName(),
 		})
 
