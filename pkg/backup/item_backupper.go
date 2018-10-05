@@ -343,9 +343,9 @@ func (ib *defaultItemBackupper) executeActions(
 	return obj, nil
 }
 
-// getBlockStore gets and initializes a BlockStore given a VolumeSnapshotLocation, returning an
-// existing one if one's already been initialized for the location.
-func (ib *defaultItemBackupper) getBlockStore(snapshotLocation *api.VolumeSnapshotLocation) (cloudprovider.BlockStore, error) {
+// blockStore instantiates and initializes a BlockStore given a VolumeSnapshotLocation,
+// or returns an existing one if one's already been initialized for the location.
+func (ib *defaultItemBackupper) blockStore(snapshotLocation *api.VolumeSnapshotLocation) (cloudprovider.BlockStore, error) {
 	if bs, ok := ib.snapshotLocationBlockStores[snapshotLocation.Name]; ok {
 		return bs, nil
 	}
@@ -417,7 +417,7 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, log log
 	)
 
 	for _, snapshotLocation := range ib.backup.SnapshotLocations {
-		bs, err := ib.getBlockStore(snapshotLocation)
+		bs, err := ib.blockStore(snapshotLocation)
 		if err != nil {
 			log.WithError(err).WithField("volumeSnapshotLocation", snapshotLocation).Error("Error getting block store for volume snapshot location")
 			continue
